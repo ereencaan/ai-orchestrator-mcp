@@ -1,0 +1,17 @@
+{
+  "name": "ai-orchestrator-mcp",
+  "version": "1.0.0",
+  "description": "MCP server: multi-model AI pipeline - Sonnet supervisor, Haiku worker, Gemini+OpenAI review",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@anthropic-ai/sdk": "^0.81.0",
+    "openai": "^4.0.0",
+    "@google/generative-ai": "^0.21.0",
+    "dotenv": "^16.4.0"
+  }
+}
