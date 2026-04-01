@@ -16,6 +16,13 @@ fi
 RUNNER="$REPO_DIR/scripts/post-commit-review.mjs"
 COMMIT_HASH=$(git rev-parse HEAD)
 SHORT_HASH=$(git rev-parse --short HEAD)
+COMMIT_MSG=$(git log -1 --format=%s)
+
+# Skip auto-fix commits to prevent infinite loop
+if [[ "$COMMIT_MSG" == auto-fix:* ]]; then
+  echo "=== Post-commit: Skipping review for auto-fix commit $SHORT_HASH ==="
+  exit 0
+fi
 
 echo "=== Post-commit: Starting AI review for $SHORT_HASH in background ==="
 echo "=== Follow live: tail -f $REPO_DIR/logs/latest.log ==="
