@@ -115,7 +115,7 @@ async function reviewFile(client, filePath, lang) {
   const result = await client.callTool(
     { name: "orchestrate_review", arguments: { code, language: lang, focus: "bugs" } },
     undefined,
-    { timeout: 180000 }
+    { timeout: 300000 }
   );
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   const text = result.content?.[0]?.text || "";
@@ -156,7 +156,7 @@ async function autoFix(client, filePath, lang, code, issues) {
       arguments: { code, language: lang, instructions },
     },
     undefined,
-    { timeout: 300000 }
+    { timeout: 600000 }
   );
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   const text = result.content?.[0]?.text || "";
