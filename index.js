@@ -20,7 +20,7 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 // --- Model Constants ---
 
 const SONNET_MODEL = "claude-sonnet-4-20250514";
-const HAIKU_MODEL = "claude-haiku-4-20250414";
+const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 const GEMINI_MODEL = "gemini-2.5-flash";
 const OPENAI_MODEL = "gpt-4o-mini";
 const MAX_ITERATIONS = 3;
