@@ -27,6 +27,7 @@ const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 const GEMINI_MODEL = "gemini-2.5-flash";
 const OPENAI_MODEL = "gpt-4o-mini";
 const MAX_ITERATIONS = 3;
+const MAX_RESTARTS = 3;
 
 // --- System Prompts ---
 
@@ -111,6 +112,64 @@ async function askOpenAI(prompt) {
   return response.choices[0].message.content;
 }
 
+// --- PipelineLogger ---
+
+class PipelineLogger {
+  constructor(server, toolName) {
+    this.server = server;
+    this.toolName = toolName;
+    this.entries = [];
+    this.startTime = Date.now();
+  }
+
+  async log(level, stage, message) {
+    const now = Date.now();
+    const elapsed = now - this.startTime;
+    const entry = { timestamp: new Date(now).toISOString(), elapsed, level, stage, message };
+    this.entries.push(entry);
+    try {
+      this.server.sendLoggingMessage({
+        level,
+        logger: `orchestrator/${this.toolName}`,
+        data: { stage, message, elapsed },
+      });
+    } catch {}
+  }
+
+  formatLog() {
+    if (this.entries.length === 0) return "";
+    const totalMs = Date.now() - this.startTime;
+    let output = `\n---\n\n### Execution Log (${(totalMs / 1000).toFixed(1)}s total)\n\n`;
+    output += "| Elapsed | Level | Stage | Message |\n";
+    output += "|---------|-------|-------|---------|\n";
+    for (const e of this.entries) {
+      const sec = (e.elapsed / 1000).toFixed(1).padStart(7);
+      const lvl = e.level.toUpperCase().padEnd(7);
+      const stg = e.stage.padEnd(14);
+      output += `| ${sec}s | ${lvl} | ${stg} | ${e.message} |\n`;
+    }
+    return output;
+  }
+}
+
+// --- Retry Wrapper ---
+
+async function runWithRetry(pipelineFn, logger) {
+  for (let attempt = 1; attempt <= MAX_RESTARTS + 1; attempt++) {
+    try {
+      if (attempt > 1) {
+        await logger.log("warning", "restart", `Pipeline restarting (attempt ${attempt}/${MAX_RESTARTS + 1})...`);
+      }
+      return await pipelineFn(attempt);
+    } catch (error) {
+      await logger.log("error", "pipeline-error", `Attempt ${attempt} failed: ${error.message}`);
+      if (attempt > MAX_RESTARTS) {
+        return `## Pipeline Failed\n\n**Error:** ${error.message}\n**Attempts:** ${attempt}\n${logger.formatLog()}`;
+      }
+    }
+  }
+}
+
 // --- Utility Functions ---
 
 function extractCodeBlock(text) {
@@ -160,75 +219,78 @@ ${code}
 
 // --- Pipeline Functions ---
 
-async function runCodePipeline(request, language, context, maxIterations) {
+async function runCodePipeline(request, language, context, maxIterations, logger, sendProgress) {
   const iterations = [];
   let finalCode = "";
   let feedback = "";
+  const stagesPerIter = 5;
+  const totalStages = maxIterations * stagesPerIter;
 
   for (let i = 1; i <= maxIterations; i++) {
     const iterationLog = { iteration: i, stages: {} };
+    const base = (i - 1) * stagesPerIter;
 
     // STAGE 1: Sonnet Supervisor
+    await logger.log("info", "supervisor", `Iter ${i}: Sending request to Sonnet supervisor...`);
+    await sendProgress(base + 1, totalStages, `Iter ${i}: Sonnet supervisor`);
+
     const supervisorInput = feedback
       ? `Original request: ${request}\nLanguage: ${language}\n${context ? `Context: ${context}\n` : ""}PREVIOUS ATTEMPT FAILED. Feedback from reviewers:\n${feedback}\n\nRewrite the specification addressing ALL issues above.`
       : `Request: ${request}\nLanguage: ${language}\n${context ? `Context: ${context}` : ""}`;
 
-    const specification = await askSonnet(
-      SONNET_SUPERVISOR_SYSTEM,
-      supervisorInput
-    );
+    const specification = await askSonnet(SONNET_SUPERVISOR_SYSTEM, supervisorInput);
     iterationLog.stages.supervisor = specification.substring(0, 300) + "...";
+    await logger.log("info", "supervisor", `Iter ${i}: Spec received (${specification.length} chars)`);
 
     // STAGE 2: Haiku Worker
+    await logger.log("info", "worker", `Iter ${i}: Sending spec to Haiku worker...`);
+    await sendProgress(base + 2, totalStages, `Iter ${i}: Haiku worker`);
+
     const haikuInput = `Language: ${language}\n\nSpecification:\n${specification}`;
     const haikuOutput = await askHaiku(HAIKU_WORKER_SYSTEM, haikuInput);
     finalCode = extractCodeBlock(haikuOutput);
     iterationLog.stages.worker = `Generated ${finalCode.length} characters of code`;
+    await logger.log("info", "worker", `Iter ${i}: Code generated (${finalCode.length} chars)`);
 
     // STAGE 3: Sonnet Reviewer
+    await logger.log("info", "sonnet-review", `Iter ${i}: Sonnet reviewing code...`);
+    await sendProgress(base + 3, totalStages, `Iter ${i}: Sonnet review`);
+
     const reviewInput = `Original request: ${request}\nLanguage: ${language}\n\nGenerated code:\n\`\`\`${language}\n${finalCode}\n\`\`\`\n\nDoes this code fully satisfy the original request? Check for bugs, missing features, and security issues.`;
     const reviewOutput = await askSonnet(SONNET_REVIEWER_SYSTEM, reviewInput);
     const review = parseReviewJSON(reviewOutput);
     iterationLog.stages.sonnetReview = review;
+    await logger.log("info", "sonnet-review", `Iter ${i}: pass=${review.pass}, issues=${review.issues.length}`);
 
     // STAGE 4: Gemini + OpenAI Review (parallel)
+    await logger.log("info", "external", `Iter ${i}: Gemini + OpenAI parallel review...`);
+    await sendProgress(base + 4, totalStages, `Iter ${i}: External reviews`);
+
     const externalPrompt = buildExternalReviewPrompt(finalCode, language);
     const [geminiReview, openaiReview] = await Promise.all([
-      askGemini(externalPrompt).catch((e) => `Gemini error: ${e.message}`),
-      askOpenAI(externalPrompt).catch((e) => `OpenAI error: ${e.message}`),
+      askGemini(externalPrompt),
+      askOpenAI(externalPrompt),
     ]);
     iterationLog.stages.geminiReview = geminiReview.substring(0, 500);
     iterationLog.stages.openaiReview = openaiReview.substring(0, 500);
+    await logger.log("info", "external", `Iter ${i}: External reviews received`);
 
     iterations.push(iterationLog);
 
     // STAGE 5: Decision
+    await sendProgress(base + 5, totalStages, `Iter ${i}: Decision`);
     const externalBlocking = hasBlockingIssues(geminiReview, openaiReview);
 
     if (review.pass && !externalBlocking) {
-      return formatResult(
-        finalCode,
-        language,
-        iterations,
-        i,
-        "PASSED",
-        review,
-        geminiReview,
-        openaiReview
-      );
+      await logger.log("info", "decision", `Iter ${i}: ALL REVIEWS PASSED`);
+      const result = formatResult(finalCode, language, iterations, i, "PASSED", review, geminiReview, openaiReview);
+      return result + logger.formatLog();
     }
 
     if (i === maxIterations) {
-      return formatResult(
-        finalCode,
-        language,
-        iterations,
-        i,
-        "MAX_ITERATIONS",
-        review,
-        geminiReview,
-        openaiReview
-      );
+      await logger.log("warning", "decision", `Iter ${i}: Max iterations reached, returning best result`);
+      const result = formatResult(finalCode, language, iterations, i, "MAX_ITERATIONS", review, geminiReview, openaiReview);
+      return result + logger.formatLog();
     }
 
     // Build feedback for next iteration
@@ -239,10 +301,14 @@ async function runCodePipeline(request, language, context, maxIterations) {
       allIssues.push(`OpenAI: ${openaiReview.substring(0, 300)}`);
     }
     feedback = allIssues.join("\n\n");
+    await logger.log("warning", "decision", `Iter ${i}: Issues found, retrying. Feedback: ${feedback.substring(0, 150)}...`);
   }
 }
 
-async function runReviewPipeline(code, language, focus) {
+async function runReviewPipeline(code, language, focus, logger, sendProgress) {
+  await logger.log("info", "review-start", "Starting parallel 3-model review...");
+  await sendProgress(1, 3, "Sending to Sonnet + Gemini + OpenAI");
+
   const reviewPrompt = `Review the following ${language} code.${focus ? ` Focus on: ${focus}.` : ""}
 
 Be concise and actionable. Provide:
@@ -256,23 +322,29 @@ ${code}
 \`\`\``;
 
   const [sonnetReview, geminiReview, openaiReview] = await Promise.all([
-    askSonnet(
-      "You are a senior code reviewer. Be thorough but concise.",
-      reviewPrompt
-    ),
-    askGemini(reviewPrompt).catch((e) => `Gemini error: ${e.message}`),
-    askOpenAI(reviewPrompt).catch((e) => `OpenAI error: ${e.message}`),
+    askSonnet("You are a senior code reviewer. Be thorough but concise.", reviewPrompt),
+    askGemini(reviewPrompt),
+    askOpenAI(reviewPrompt),
   ]);
 
-  return `## Sonnet Review (Supervisor)\n\n${sonnetReview}\n\n---\n\n## Gemini Review\n\n${geminiReview}\n\n---\n\n## OpenAI Review\n\n${openaiReview}`;
+  await logger.log("info", "sonnet", `Sonnet review received (${sonnetReview.length} chars)`);
+  await logger.log("info", "gemini", `Gemini review received (${geminiReview.length} chars)`);
+  await logger.log("info", "openai", `OpenAI review received (${openaiReview.length} chars)`);
+  await sendProgress(3, 3, "All reviews complete");
+
+  const result = `## Sonnet Review (Supervisor)\n\n${sonnetReview}\n\n---\n\n## Gemini Review\n\n${geminiReview}\n\n---\n\n## OpenAI Review\n\n${openaiReview}`;
+  return result + logger.formatLog();
 }
 
-async function runRefactorPipeline(code, language, instructions, context) {
+async function runRefactorPipeline(code, language, instructions, context, logger, sendProgress) {
+  await logger.log("info", "refactor", "Starting refactor pipeline...");
   return runCodePipeline(
     `Refactor the following code according to these instructions: ${instructions}\n\nExisting code:\n\`\`\`${language}\n${code}\n\`\`\``,
     language,
     context,
-    MAX_ITERATIONS
+    MAX_ITERATIONS,
+    logger,
+    sendProgress
   );
 }
 
@@ -317,7 +389,7 @@ const TOOLS = [
   {
     name: "orchestrate_code",
     description:
-      "Full AI pipeline: Sonnet designs the spec, Haiku writes code, Sonnet reviews, then Gemini+OpenAI do final review. Auto-retries up to 3 times if issues found. Use this to generate high-quality code from a description.",
+      "Full AI pipeline: Sonnet designs the spec, Haiku writes code, Sonnet reviews, then Gemini+OpenAI do final review. Auto-retries up to 3 times if issues found. Includes live logging and auto-restart on failures.",
     inputSchema: {
       type: "object",
       properties: {
@@ -345,7 +417,7 @@ const TOOLS = [
   {
     name: "orchestrate_review",
     description:
-      "Send code to Sonnet + Gemini + OpenAI simultaneously for a triple-review. Get three independent perspectives on bugs, security, performance.",
+      "Send code to Sonnet + Gemini + OpenAI simultaneously for a triple-review. Includes live logging and auto-restart on failures.",
     inputSchema: {
       type: "object",
       properties: {
@@ -365,7 +437,7 @@ const TOOLS = [
   {
     name: "orchestrate_refactor",
     description:
-      "Refactor existing code through the full pipeline. Sonnet plans the refactor, Haiku implements it, then triple-review validates the result.",
+      "Refactor existing code through the full pipeline. Sonnet plans the refactor, Haiku implements it, then triple-review validates the result. Includes live logging and auto-restart on failures.",
     inputSchema: {
       type: "object",
       properties: {
@@ -390,20 +462,24 @@ const TOOLS = [
 
 // --- Tool Handler ---
 
-async function handleTool(name, args) {
+async function handleTool(name, args, logger, sendProgress) {
   switch (name) {
     case "orchestrate_code": {
       const maxIter = Math.min(args.max_iterations || MAX_ITERATIONS, MAX_ITERATIONS);
-      return runCodePipeline(args.request, args.language, args.context, maxIter);
+      return runWithRetry(
+        () => runCodePipeline(args.request, args.language, args.context, maxIter, logger, sendProgress),
+        logger
+      );
     }
     case "orchestrate_review":
-      return runReviewPipeline(args.code, args.language, args.focus);
+      return runWithRetry(
+        () => runReviewPipeline(args.code, args.language, args.focus, logger, sendProgress),
+        logger
+      );
     case "orchestrate_refactor":
-      return runRefactorPipeline(
-        args.code,
-        args.language,
-        args.instructions,
-        args.context
+      return runWithRetry(
+        () => runRefactorPipeline(args.code, args.language, args.instructions, args.context, logger, sendProgress),
+        logger
       );
     default:
       throw new Error(`Unknown tool: ${name}`);
@@ -413,24 +489,38 @@ async function handleTool(name, args) {
 // --- MCP Server Setup ---
 
 const server = new Server(
-  { name: "ai-orchestrator-mcp", version: "1.0.0" },
-  { capabilities: { tools: {} } }
+  { name: "ai-orchestrator-mcp", version: "1.1.0" },
+  { capabilities: { tools: {}, logging: {} } }
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: TOOLS,
 }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+  const toolName = request.params.name;
+  const logger = new PipelineLogger(server, toolName);
+  const progressToken = request.params._meta?.progressToken;
+
+  const sendProgress = async (current, total, message) => {
+    if (progressToken !== undefined) {
+      try {
+        await extra.sendNotification({
+          method: "notifications/progress",
+          params: { progressToken, progress: current, total, message },
+        });
+      } catch {}
+    }
+  };
+
   try {
-    const result = await handleTool(
-      request.params.name,
-      request.params.arguments
-    );
+    await logger.log("info", "init", `Pipeline started: ${toolName}`);
+    const result = await handleTool(toolName, request.params.arguments, logger, sendProgress);
     return { content: [{ type: "text", text: result }] };
   } catch (error) {
+    await logger.log("error", "fatal", `Unhandled error: ${error.message}`);
     return {
-      content: [{ type: "text", text: `Pipeline Error: ${error.message}` }],
+      content: [{ type: "text", text: `## Pipeline Error\n\n**Error:** ${error.message}\n${logger.formatLog()}` }],
       isError: true,
     };
   }
