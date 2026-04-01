@@ -14,8 +14,10 @@ import { extname, dirname, join } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const REPO_DIR = join(__dirname, "..");
-const LOGS_DIR = join(REPO_DIR, "logs");
+const ORCHESTRATOR_DIR = process.env.AI_ORCHESTRATOR_DIR || join(__dirname, "..");
+// REPO_DIR = the project being reviewed (passed via env or cwd)
+const REPO_DIR = process.env.REVIEW_REPO_DIR || process.cwd();
+const LOGS_DIR = join(ORCHESTRATOR_DIR, "logs");
 const LATEST_LOG = join(LOGS_DIR, "latest.log");
 const MAX_FIX_CYCLES = 3;
 
@@ -77,8 +79,8 @@ if (codeFiles.length === 0) {
 const NODE_PATH = process.execPath;
 const transport = new StdioClientTransport({
   command: NODE_PATH,
-  args: [join(REPO_DIR, "index.js")],
-  cwd: REPO_DIR,
+  args: [join(ORCHESTRATOR_DIR, "index.js")],
+  cwd: ORCHESTRATOR_DIR,
 });
 
 const client = new Client(

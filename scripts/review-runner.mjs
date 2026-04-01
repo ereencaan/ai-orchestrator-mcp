@@ -71,14 +71,14 @@ if (code.trim().length === 0) {
   process.exit(0);
 }
 
-// Connect to MCP server
+// Connect to MCP server (always points to the orchestrator install)
 const NODE_PATH = process.execPath;
-const SERVER_DIR = new URL("..", import.meta.url).pathname.replace(/^\/([A-Z]:)/, "$1");
+const ORCHESTRATOR_DIR = process.env.AI_ORCHESTRATOR_DIR || "C:\\Users\\ereen\\ai-orchestrator-mcp";
 
 const transport = new StdioClientTransport({
   command: NODE_PATH,
-  args: [SERVER_DIR + "index.js"],
-  cwd: SERVER_DIR,
+  args: [ORCHESTRATOR_DIR + "\\index.js"],
+  cwd: ORCHESTRATOR_DIR,
 });
 
 const client = new Client(
