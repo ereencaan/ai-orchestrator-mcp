@@ -37,6 +37,7 @@ const SKIP_FILES = [
 
 const filePath = process.argv[2];
 const forceLang = process.argv[3];
+const useQuickReview = process.argv[4] === "--quick";
 
 if (!filePath) {
   console.error("Usage: node review-runner.mjs <file_path> [language]");
@@ -89,13 +90,14 @@ const client = new Client(
 try {
   await client.connect(transport);
 
+  const toolName = useQuickReview ? "quick_review" : "orchestrate_review";
   const result = await client.callTool(
     {
-      name: "orchestrate_review",
+      name: toolName,
       arguments: { code, language, focus: "bugs" },
     },
     undefined,
-    { timeout: 120000 }
+    { timeout: useQuickReview ? 30000 : 120000 }
   );
 
   await client.close();

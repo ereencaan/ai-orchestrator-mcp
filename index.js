@@ -305,6 +305,30 @@ async function runCodePipeline(request, language, context, maxIterations, logger
   }
 }
 
+async function runQuickReviewPipeline(code, language, focus, logger, sendProgress) {
+  await logger.log("info", "quick-review", "Starting Sonnet-only quick review...");
+  await sendProgress(1, 2, "Sending to Sonnet");
+
+  const reviewPrompt = `Review the following ${language} code.${focus ? ` Focus on: ${focus}.` : ""}
+
+Only report CRITICAL issues: bugs, security vulnerabilities, logic errors, crashes.
+Do NOT report style, naming, or minor suggestions.
+Rate severity: CRITICAL or SKIP.
+If no critical issues, just say "No critical issues found."
+
+\`\`\`${language}
+${code}
+\`\`\``;
+
+  const sonnetReview = await askSonnet("You are a senior code reviewer. Only flag critical bugs and security issues. Be very concise.", reviewPrompt);
+
+  await logger.log("info", "quick-review", `Sonnet review received (${sonnetReview.length} chars)`);
+  await sendProgress(2, 2, "Quick review complete");
+
+  const result = `## Quick Review (Sonnet Only)\n\n${sonnetReview}`;
+  return result + logger.formatLog();
+}
+
 async function runReviewPipeline(code, language, focus, logger, sendProgress) {
   await logger.log("info", "review-start", "Starting parallel 3-model review...");
   await sendProgress(1, 3, "Sending to Sonnet + Gemini + OpenAI");
@@ -415,6 +439,26 @@ const TOOLS = [
     },
   },
   {
+    name: "quick_review",
+    description:
+      "Lightweight Sonnet-only review for pre-commit hooks. Only flags critical bugs and security issues. Fast and cheap.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        code: { type: "string", description: "The code to review" },
+        language: {
+          type: "string",
+          description: "Programming language (e.g. csharp, javascript)",
+        },
+        focus: {
+          type: "string",
+          description: "Review focus: security, performance, bugs (optional)",
+        },
+      },
+      required: ["code", "language"],
+    },
+  },
+  {
     name: "orchestrate_review",
     description:
       "Send code to Sonnet + Gemini + OpenAI simultaneously for a triple-review. Includes live logging and auto-restart on failures.",
@@ -471,6 +515,11 @@ async function handleTool(name, args, logger, sendProgress) {
         logger
       );
     }
+    case "quick_review":
+      return runWithRetry(
+        () => runQuickReviewPipeline(args.code, args.language, args.focus, logger, sendProgress),
+        logger
+      );
     case "orchestrate_review":
       return runWithRetry(
         () => runReviewPipeline(args.code, args.language, args.focus, logger, sendProgress),
