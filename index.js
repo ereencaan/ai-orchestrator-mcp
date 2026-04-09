@@ -1,3 +1,11 @@
+import fetch from "node-fetch";
+if (!globalThis.fetch) {
+  globalThis.fetch = fetch;
+  globalThis.Request = (await import("node-fetch")).Request;
+  globalThis.Response = (await import("node-fetch")).Response;
+  globalThis.Headers = (await import("node-fetch")).Headers;
+}
+
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
