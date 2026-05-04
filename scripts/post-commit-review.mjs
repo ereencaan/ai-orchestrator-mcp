@@ -12,6 +12,7 @@ import { readFileSync, writeFileSync, appendFileSync, mkdirSync } from "fs";
 import { execSync } from "child_process";
 import { extname, dirname, join } from "path";
 import { fileURLToPath } from "url";
+import { classifyReview } from "./review-parser.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ORCHESTRATOR_DIR = process.env.AI_ORCHESTRATOR_DIR || join(__dirname, "..");
@@ -20,6 +21,10 @@ const REPO_DIR = process.env.REVIEW_REPO_DIR || process.cwd();
 const LOGS_DIR = join(ORCHESTRATOR_DIR, "logs");
 const LATEST_LOG = join(LOGS_DIR, "latest.log");
 const MAX_FIX_CYCLES = 3;
+// Same guard as review-runner.mjs — don't burn money sending huge
+// generated/vendored files to the orchestrator. Override per-call via
+// AI_REVIEW_MAX_BYTES if you really want to review a big file.
+const MAX_BYTES = parseInt(process.env.AI_REVIEW_MAX_BYTES || "65536", 10);
 
 const LANG_MAP = {
   ".js": "javascript", ".mjs": "javascript", ".ts": "typescript",
@@ -112,6 +117,14 @@ async function reviewFile(client, filePath, lang) {
   if (code.trim().length === 0) {
     return { status: "skip", text: "" };
   }
+  if (code.length > MAX_BYTES) {
+    log(
+      "info",
+      `${filePath}: skipped (${code.length} bytes > ${MAX_BYTES} limit). ` +
+        `Set AI_REVIEW_MAX_BYTES to override.`
+    );
+    return { status: "skip", text: "" };
+  }
 
   const startTime = Date.now();
   const result = await client.callTool(
@@ -122,32 +135,70 @@ async function reviewFile(client, filePath, lang) {
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   const text = result.content?.[0]?.text || "";
 
-  // Count actual issue severity markers (not mentions in instructions/headers)
-  // Only match "CRITICAL" when it appears as a severity label for a specific issue
-  const criticalIssuePattern = /(?:severity:\s*CRITICAL|\*\*CRITICAL\*\*|CRITICAL\s*[-:])/gi;
-  const criticalMatches = text.match(criticalIssuePattern) || [];
-  const hasCritical = criticalMatches.length >= 2; // At least 2 models flagged critical
-
-  const bugPattern = /(?:\*\*bug\*\*|confirmed\s+bug|logic\s+error\s+(?:in|found)|will\s+crash|null\s+pointer|race\s+condition)/gi;
-  const bugMatches = text.match(bugPattern) || [];
-  const hasBugs = bugMatches.length >= 2;
+  const { isPipelineFailure, hasCritical, hasBugs } = classifyReview(text);
 
   let status = "clean";
-  if (hasCritical) status = "critical";
+  if (isPipelineFailure) status = "skip"; // orchestrator failed -> don't auto-fix on garbage
+  else if (hasCritical) status = "critical";
   else if (hasBugs) status = "warning";
 
   return { status, text, elapsed, code };
 }
 
+// --- Helper: sanity-check the auto-fix output ---
+// Cheap, language-agnostic guards that catch the common ways an LLM
+// refactor goes wrong: empty output, truncated output, or wholesale
+// rewrites of unrelated code. Returns null if the fix looks reasonable,
+// or a short reason string if it should be rejected.
+function sanityCheckFix({ original, fixed, lang }) {
+  if (!fixed || fixed.trim().length === 0) return "empty fix";
+  // Fix that is suspiciously shorter than the original is almost
+  // always a truncated response. Allow up to 50% shrink for legitimate
+  // simplifications.
+  if (fixed.length < original.length * 0.5) {
+    return `fix is <50% of original size (${fixed.length} vs ${original.length})`;
+  }
+  // ...or absurdly larger (LLM hallucinating extra code).
+  if (fixed.length > original.length * 5) {
+    return `fix is >5x original size`;
+  }
+  // Brace/bracket/paren balance check for C-family languages and
+  // Python doesn't need it (whitespace-significant). Catches the
+  // classic "stopped mid-block" failure mode.
+  const cFamily = ["javascript", "typescript", "java", "csharp", "go", "cpp", "c", "rust"];
+  if (cFamily.includes(lang)) {
+    for (const [open, close] of [["{", "}"], ["(", ")"], ["[", "]"]]) {
+      const opens = (fixed.match(new RegExp(`\\${open}`, "g")) || []).length;
+      const closes = (fixed.match(new RegExp(`\\${close}`, "g")) || []).length;
+      if (opens !== closes) {
+        return `unbalanced ${open}${close} (${opens} vs ${closes})`;
+      }
+    }
+  }
+  return null;
+}
+
 // --- Helper: extract issues from review text ---
 function extractIssues(reviewText) {
+  // Only pull lines that look like enumerated findings ("1. **...", "- **...")
+  // or that carry an unambiguous severity word. The previous regex matched
+  // "error" anywhere — so a reviewer's prose like "good error handling"
+  // became a fake issue and got fed to the auto-fixer.
   const issues = [];
-  const lines = reviewText.split("\n");
-  for (const line of lines) {
-    if (/^\s*[-*]\s+\*\*/.test(line) || /^\s*\d+\.\s+\*\*/.test(line) || /CRITICAL|bug|vulnerability|injection|error/i.test(line)) {
-      const clean = line.replace(/^\s*[-*\d.]+\s*/, "").trim();
-      if (clean.length > 10 && clean.length < 500) issues.push(clean);
-    }
+  const seen = new Set();
+  const enumeratedListPattern = /^\s*(?:[-*]|\d+\.)\s+\*\*/;
+  const severePattern =
+    /\b(?:CRITICAL|SQL\s+injection|command\s+injection|XSS|RCE|CSRF|null\s+dereference|off-by-one|race\s+condition|buffer\s+overflow)\b/i;
+  for (const rawLine of reviewText.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith(">>>")) continue; // runner sentinel lines
+    if (!enumeratedListPattern.test(rawLine) && !severePattern.test(line)) continue;
+    const clean = line.replace(/^\s*[-*\d.]+\s*/, "").trim();
+    if (clean.length < 10 || clean.length > 500) continue;
+    if (seen.has(clean)) continue;
+    seen.add(clean);
+    issues.push(clean);
   }
   return issues.slice(0, 10);
 }
@@ -192,6 +243,9 @@ try {
   let totalCritical = 0;
   let totalWarning = 0;
   let totalClean = 0;
+  // Track exactly which files we wrote, so we can stage only those at
+  // commit time and never sweep up unrelated working-tree changes.
+  const fixedFilePaths = [];
 
   for (let i = 0; i < codeFiles.length; i++) {
     const file = codeFiles[i];
@@ -253,10 +307,24 @@ try {
         break;
       }
 
+      // Sanity gate before clobbering the user's file.
+      // If the auto-fixer returned something that looks broken we abort
+      // rather than overwriting working code with garbage.
+      const sanityIssue = sanityCheckFix({
+        original: review.code,
+        fixed: fixedCode,
+        lang,
+      });
+      if (sanityIssue) {
+        log("warning", `${file}: Auto-fix rejected (${sanityIssue}). Keeping original.`);
+        break;
+      }
+
       // Write fixed code to file
       writeFileSync(join(REPO_DIR, file), fixedCode);
       log("info", `${file}: Fixed code written to disk. Re-reviewing...`);
       totalFixed++;
+      fixedFilePaths.push(file);
 
       // Loop continues → re-review
     }
@@ -267,14 +335,21 @@ try {
     else totalClean++;
   }
 
-  // Auto-commit fixes if any files were fixed
-  if (totalFixed > 0) {
+  // Auto-commit fixes if any files were fixed.
+  if (totalFixed > 0 && fixedFilePaths.length > 0) {
     log("info", "");
     log("info", `>>> ${totalFixed} file(s) auto-fixed. Creating fix commit... <<<`);
     try {
-      execSync("git add -A", { cwd: REPO_DIR });
+      // Only stage the exact files we wrote — never `git add -A`,
+      // which would scoop up the user's other working-tree changes.
+      for (const f of fixedFilePaths) {
+        execSync(`git add -- ${JSON.stringify(f)}`, { cwd: REPO_DIR });
+      }
+      // Don't pass --no-verify: the pre-commit hook is advisory and
+      // gives us a free sanity check on the auto-fix itself. The
+      // post-commit hook recognises "auto-fix:" prefix and won't recurse.
       execSync(
-        `git commit --no-verify -m "auto-fix: resolve critical issues from review of ${shortHash}"`,
+        `git commit -m "auto-fix: resolve critical issues from review of ${shortHash}"`,
         { cwd: REPO_DIR }
       );
       const newHash = execSync("git rev-parse --short HEAD", { cwd: REPO_DIR }).toString().trim();
