@@ -20,7 +20,20 @@ import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-dotenv.config({ path: join(__dirname, ".env") });
+// override:true so .env wins over inherited empty-string env vars
+// (Claude Code spawns MCP servers with ANTHROPIC_API_KEY="" which would
+// otherwise silently shadow the real key from .env).
+dotenv.config({ path: join(__dirname, ".env"), override: true });
+
+const requiredKeys = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"];
+const missingKeys = requiredKeys.filter((k) => !process.env[k]);
+if (missingKeys.length > 0) {
+  console.error(
+    `[ai-orchestrator] FATAL: missing API keys: ${missingKeys.join(", ")}. ` +
+      `Set them in ${join(__dirname, ".env")} or the parent environment.`
+  );
+  process.exit(1);
+}
 
 // --- Clients ---
 
@@ -210,7 +223,13 @@ function parseReviewJSON(text) {
 function hasBlockingIssues(geminiReview, openaiReview) {
   const blocking =
     /\b(critical|severe|bug|vulnerability|security issue|logic error|crash|broken)\b/i;
-  return blocking.test(geminiReview) || blocking.test(openaiReview);
+  // Skip provider-unavailable placeholders so an outage cannot trigger
+  // "blocking issues" on words inside an error message.
+  const isUnavailable = (s) => /^_\(.*unavailable:.*\)_$/.test(s.trim());
+  return (
+    (!isUnavailable(geminiReview) && blocking.test(geminiReview)) ||
+    (!isUnavailable(openaiReview) && blocking.test(openaiReview))
+  );
 }
 
 function buildExternalReviewPrompt(code, language) {
@@ -275,12 +294,27 @@ async function runCodePipeline(request, language, context, maxIterations, logger
     await sendProgress(base + 4, totalStages, `Iter ${i}: External reviews`);
 
     const externalPrompt = buildExternalReviewPrompt(finalCode, language);
-    const [geminiReview, openaiReview] = await Promise.all([
+    // Tolerate single-provider outages here too (Gemini-flash 503s are common).
+    const [geminiSettled, openaiSettled] = await Promise.allSettled([
       askGemini(externalPrompt),
       askOpenAI(externalPrompt),
     ]);
+    const geminiReview =
+      geminiSettled.status === "fulfilled"
+        ? geminiSettled.value
+        : `_(Gemini unavailable: ${geminiSettled.reason?.message || "unknown error"})_`;
+    const openaiReview =
+      openaiSettled.status === "fulfilled"
+        ? openaiSettled.value
+        : `_(OpenAI unavailable: ${openaiSettled.reason?.message || "unknown error"})_`;
     iterationLog.stages.geminiReview = geminiReview.substring(0, 500);
     iterationLog.stages.openaiReview = openaiReview.substring(0, 500);
+    if (geminiSettled.status !== "fulfilled") {
+      await logger.log("warning", "external", `Iter ${i}: Gemini failed: ${geminiSettled.reason?.message || "unknown"}`);
+    }
+    if (openaiSettled.status !== "fulfilled") {
+      await logger.log("warning", "external", `Iter ${i}: OpenAI failed: ${openaiSettled.reason?.message || "unknown"}`);
+    }
     await logger.log("info", "external", `Iter ${i}: External reviews received`);
 
     iterations.push(iterationLog);
@@ -353,15 +387,44 @@ Be concise and actionable. Provide:
 ${code}
 \`\`\``;
 
-  const [sonnetReview, geminiReview, openaiReview] = await Promise.all([
+  // Tolerate single-provider outages: use allSettled so a Gemini 503 or
+  // OpenAI hiccup doesn't sink the entire review when the other two
+  // providers responded fine. We require Sonnet (the supervisor) to
+  // succeed; Gemini and OpenAI are graded as best-effort.
+  const [sonnetSettled, geminiSettled, openaiSettled] = await Promise.allSettled([
     askSonnet("You are a senior code reviewer. Be thorough but concise.", reviewPrompt),
     askGemini(reviewPrompt),
     askOpenAI(reviewPrompt),
   ]);
 
+  if (sonnetSettled.status === "rejected") {
+    throw sonnetSettled.reason;
+  }
+  const sonnetReview = sonnetSettled.value;
+  const geminiReview =
+    geminiSettled.status === "fulfilled"
+      ? geminiSettled.value
+      : `_(Gemini unavailable: ${geminiSettled.reason?.message || "unknown error"})_`;
+  const openaiReview =
+    openaiSettled.status === "fulfilled"
+      ? openaiSettled.value
+      : `_(OpenAI unavailable: ${openaiSettled.reason?.message || "unknown error"})_`;
+
   await logger.log("info", "sonnet", `Sonnet review received (${sonnetReview.length} chars)`);
-  await logger.log("info", "gemini", `Gemini review received (${geminiReview.length} chars)`);
-  await logger.log("info", "openai", `OpenAI review received (${openaiReview.length} chars)`);
+  await logger.log(
+    geminiSettled.status === "fulfilled" ? "info" : "warning",
+    "gemini",
+    geminiSettled.status === "fulfilled"
+      ? `Gemini review received (${geminiReview.length} chars)`
+      : `Gemini failed: ${geminiSettled.reason?.message || "unknown"}`
+  );
+  await logger.log(
+    openaiSettled.status === "fulfilled" ? "info" : "warning",
+    "openai",
+    openaiSettled.status === "fulfilled"
+      ? `OpenAI review received (${openaiReview.length} chars)`
+      : `OpenAI failed: ${openaiSettled.reason?.message || "unknown"}`
+  );
   await sendProgress(3, 3, "All reviews complete");
 
   const result = `## Sonnet Review (Supervisor)\n\n${sonnetReview}\n\n---\n\n## Gemini Review\n\n${geminiReview}\n\n---\n\n## OpenAI Review\n\n${openaiReview}`;
